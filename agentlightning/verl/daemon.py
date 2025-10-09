@@ -424,15 +424,38 @@ class AgentModeDaemon:
                 print(f"Warning: No triplets found for training rollout {rollout.rollout_id}, skipping.")
                 continue
 
+            # Extract node-specific rewards from rollout metadata
+            node_rewards: Dict[str, float] = rollout.metadata.get("node_rewards", {}) if rollout.metadata else {}  # type: ignore
+            
             # The client should report triplets that contain prompt_ids and response_ids.
             # Example triplet.prompt: {"token_ids": [...]}
             # Example triplet.response: {"token_ids": [...]}
-            trace_list = [
-                {"prompt_ids": t.prompt.get("token_ids", []), "response_ids": t.response.get("token_ids", [])}
-                for t in rollout.triplets
-            ]
+            trace_list = []
+            for t in rollout.triplets:
+                agent_name = t.metadata.get("agent_name", "")
+                
+                # Determine reward based on agent_name
+                if "generate_agent" in agent_name:
+                    reward = node_rewards.get("agent_reward", final_reward)
+                elif "generate_workflow_1" in agent_name:
+                    reward = node_rewards.get("workflow_1_score", final_reward)
+                elif "generate_workflow_2" in agent_name:
+                    reward = node_rewards.get("workflow_2_score", final_reward)
+                elif "generate_workflow_3" in agent_name:
+                    reward = node_rewards.get("workflow_3_score", final_reward)
+                else:
+                    # Fallback to triplet reward or default
+                    reward = t.reward if t.reward is not None else final_reward
+                
+                trace_list.append({
+                    "prompt_ids": t.prompt.get("token_ids", []),
+                    "response_ids": t.response.get("token_ids", []),
+                    "reward": reward,  # Explicitly assigned based on node type
+                    "metadata": t.metadata,  # Pass through metadata for GRPO grouping
+                })
+            
             info = {
-                "reward": final_reward,
+                "reward": final_reward,  # Keep for overall metrics
                 "trace_list": trace_list,
                 "data_id": original_sample["data_id"],
             }
@@ -457,13 +480,15 @@ class AgentModeDaemon:
         data_id_list: List[str] = []
         rollout_id_list: List[str] = []
         turn_index_list: List[int] = []
+        metadata_list: List[Dict[str, Any]] = []  # NEW: Store metadata for GRPO grouping
         is_drop_list: List[bool] = []
         n_trunc_sample_because_of_response = 0
 
         for rollout_id, sample_info in finished_id_to_sample_info.items():
             for turn_index, trace in enumerate(sample_info["trace_list"]):
 
-                reward_list.append(sample_info["reward"])
+                # Use per-triplet reward instead of sample-level reward
+                reward_list.append(trace["reward"])
                 prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
 
                 # Mark samples with prompts exceeding max_prompt_length to be dropped later
@@ -493,6 +518,7 @@ class AgentModeDaemon:
                 data_id_list.append(sample_info["data_id"])
                 rollout_id_list.append(rollout_id)
                 turn_index_list.append(turn_index)
+                metadata_list.append(trace.get("metadata", {}))  # NEW: Store metadata
 
         n_transition = len(input_ids_list)
         batch_input_ids = torch.LongTensor(input_ids_list).to(device)
@@ -515,6 +541,29 @@ class AgentModeDaemon:
         token_level_scores[torch.arange(n_transition), eos_mask_idx] = scores
         # Only take the last response_length part of the sequence to get the token-level scores for the model's response part.
         token_level_scores = token_level_scores[:, -max_response_length:]
+
+        # Create hierarchical GRPO group IDs based on node type
+        uid_list: List[str] = []
+        agent_turn_counter: Dict[str, int] = {}  # Track agent turn indices per data_id
+
+        for data_id, metadata in zip(data_id_list, metadata_list):
+            agent_name = metadata.get("agent_name", "")
+
+            if "generate_agent" in agent_name:
+                # Agent nodes: group by data_id only (compare all agents for same prompt)
+                uid = data_id
+                # Track this as a new agent turn
+                agent_turn_counter[data_id] = agent_turn_counter.get(data_id, 0) + 1
+            elif "generate_workflow" in agent_name:
+                # Workflow nodes: group by data_id + agent_turn_index
+                # All 3 workflows from the same agent share the same group
+                agent_turn = agent_turn_counter.get(data_id, 0)
+                uid = f"{data_id}_agent{agent_turn}"
+            else:
+                # Fallback to data_id for unknown nodes
+                uid = data_id
+
+            uid_list.append(uid)
 
         # Form the final batch using TensorDict
         batch = TensorDict(
@@ -543,6 +592,7 @@ class AgentModeDaemon:
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)  # type: ignore
         data_proto.non_tensor_batch["rollout_id_list"] = np.array(rollout_id_list)  # type: ignore
         data_proto.non_tensor_batch["turn_index_list"] = np.array(turn_index_list)  # type: ignore
+        data_proto.non_tensor_batch["uid"] = np.array(uid_list)  # type: ignore  # Custom GRPO group IDs
 
         return data_proto, data_metrics
 

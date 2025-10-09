@@ -120,8 +120,11 @@ class AgentLightningTrainer(RayPPOTrainer):
 
                     del gen_baseline_batch, gen_baseline_output
 
-            # uid is used for algorithm like GRPO, should be aligned to data id
-            batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
+            #  # uid is used for algorithm like GRPO, should be aligned to data id
+            # batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
+
+            # uid is now computed in the daemon for hierarchical GRPO grouping
+            # (no longer need to set it here, already set by AgentModeDaemon.get_train_data_batch)
 
             batch.batch["response_mask"] = compute_response_mask(batch)
 

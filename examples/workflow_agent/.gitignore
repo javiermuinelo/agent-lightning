@@ -1,0 +1,13 @@
+
+# Outputs
+outputs/
+checkpoints/
+
+# Logs
+*.log
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+
