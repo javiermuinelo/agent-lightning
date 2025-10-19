@@ -16,6 +16,10 @@ train_tasks = [
     "Implement a binary search algorithm to find a target value in a sorted array.",
     "Write a function that checks if a string is a palindrome.",
     "Create a function that generates the first n Fibonacci numbers.",
+    "Write a function that implements merge sort algorithm.",
+    "Create a function that finds the longest common subsequence.",
+    "Implement a depth-first search algorithm.",
+    "Write a function that calculates the edit distance between two strings.",
 ]
 
 # Validation data - 2 simple tasks

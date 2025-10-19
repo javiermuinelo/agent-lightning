@@ -272,10 +272,15 @@ class AgentModeDaemon:
         self.clear_data_and_server()
         self.backend_llm_server_addresses = server_addresses
         self.is_train = is_train
-
+        
         # 1. Update resources on the server for clients to use
+        # Use the head node's IP address instead of localhost for cross-node communication
+        import socket
+        head_node_ip = socket.gethostbyname(socket.gethostname())
+        endpoint_url = f"http://{head_node_ip}:{self.proxy_port}/v1"
+        print(f"[DEBUG] Using endpoint URL: {endpoint_url}")
         llm_resource = LLM(
-            endpoint=f"http://127.0.0.1:{self.proxy_port}/v1",
+            endpoint=endpoint_url,
             model=self.train_information.get("model", "default-model"),
             sampling_parameters={"temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0)},
         )

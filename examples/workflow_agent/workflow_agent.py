@@ -16,9 +16,9 @@ import os
 import time
 from typing import Any, Dict, Optional, cast
 
+import dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AnyMessage
-from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
@@ -30,90 +30,11 @@ agentlightning.configure_logger()
 
 logger = agentlightning.configure_logger(name=__name__)
 
-
-# ============================================================================
-# Prompts
-# ============================================================================
-
-AGENT_GENERATION_PROMPT = ChatPromptTemplate(
-    [
-        (
-            "system",
-            """
-You are a meta-agent that generates high-level search strategies and specifications for solving complex tasks.
-
-Given a task, you should generate:
-1. **Search Operators**: What types of decompositions or approaches to try
-2. **Constraints**: Any limitations or requirements for the solution
-3. **Guidance**: High-level hints for workflow construction
-4. **Examples**: Brief examples of similar problems and approaches
-
-Your output will guide the generation of executable workflows.
-
-## Output Format ##
-
-Respond in JSON format:
-
-```json
-{{
-  "search_operators": ["operator1", "operator2", ...],
-  "constraints": ["constraint1", "constraint2", ...],
-  "guidance": "High-level approach description",
-  "examples": ["example1", "example2", ...]
-}}
-```
-""".strip(),
-        ),
-        ("user", "Task: {task}\n\nGenerate the meta-agent specification:"),
-    ]
-)
-
-
-WORKFLOW_GENERATION_PROMPT = ChatPromptTemplate(
-    [
-        (
-            "system",
-            """
-You are a workflow generator that creates executable graphs for solving tasks.
-
-Given:
-- A task description
-- Meta-agent guidance (search operators, constraints, etc.)
-
-Generate a workflow as a Python-like pseudo-code or Mermaid graph that decomposes the task into steps.
-
-## Output Format ##
-
-Respond with a structured workflow:
-
-```python
-# Workflow Steps
-def solve_task(input):
-    # Step 1: [description]
-    step1_output = ...
-    
-    # Step 2: [description]
-    step2_output = ...
-    
-    # Step 3: [description]
-    final_output = ...
-    
-    return final_output
-```
-
-Be specific about what each step does and how they connect.
-""".strip(),
-        ),
-        (
-            "user",
-            """Task: {task}
-
-Meta-Agent Guidance:
-{agent_output}
-
-Generate workflow (attempt {workflow_id}):""",
-        ),
-    ]
+# Import prompts from separate module
+from prompts import (
+    AGENT_GENERATION_PROMPT,
+    WORKFLOW_GENERATION_PROMPT,
+    get_variation_strategy,
 )
 
 
@@ -174,11 +95,33 @@ class AgentWorkflowGraph:
         verl_replacement: Dict[str, Any] | None = None,
         debug: bool = False,
         max_retries: int = 0,
+        use_huggingface: bool = False,
     ):
         self.debug = debug
         
         # Initialize LLM
-        if verl_replacement is not None:
+        if use_huggingface:
+            # Use HuggingFace Inference Providers via init_chat_model
+            model_name = os.environ.get("MODEL", "Qwen/Qwen3-8B")
+            
+            temperature = 0.7
+            
+            self.model_name = model_name
+            
+            logger.info(f"Initializing HuggingFace model: {self.model_name}")
+            
+            # Use init_chat_model with huggingface provider - handles prompt formatting automatically!
+            self.llm = init_chat_model(
+                self.model_name,
+                model_provider="huggingface",
+                huggingfacehub_api_token=os.environ.get("HUGGINGFACEHUB_API_TOKEN"),
+                temperature=temperature,
+                max_tokens=2048,
+                max_retries=max_retries,
+            )
+            
+        elif verl_replacement is not None:
+            # Use OpenAI-compatible endpoint (for VERL training)
             self.model_name: str = verl_replacement["model"] # type: ignore
             assert endpoint is not None
             self.llm = init_chat_model(
@@ -191,12 +134,13 @@ class AgentWorkflowGraph:
                 max_tokens=2048,
             )
         else:
+            # Use standard OpenAI endpoint
             self.model_name: str = os.environ.get("MODEL", "gpt-4o-mini")
             self.llm = init_chat_model(
                 self.model_name,
                 model_provider="openai",
-                openai_api_base=endpoint or os.environ["OPENAI_API_BASE"],
-                openai_api_key=os.environ["OPENAI_API_KEY"],
+                openai_api_base=endpoint or os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
+                openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
                 temperature=0.7,
                 max_retries=1,
                 max_tokens=2048,
@@ -219,12 +163,26 @@ class AgentWorkflowGraph:
         
         return result # type: ignore
 
-    def parse_json_response(self, content: str) -> Optional[Dict[str, Any]]:
-        """Extract and parse JSON from LLM response."""
+    def extract_output_tag(self, content: str) -> str:
+        """Extract content from <output> tags if present, otherwise return full content."""
         import re
         
+        # Try to find content within <output> tags
+        output_match = re.search(r'<output>\s*(.*?)\s*</output>', content, re.DOTALL | re.IGNORECASE)
+        if output_match:
+            return output_match.group(1)
+        
+        return content
+    
+    def parse_json_response(self, content: str) -> Optional[Dict[str, Any]]:
+        """Extract and parse JSON from LLM response (looks in <output> tags first)."""
+        import re
+        
+        # First, extract content from <output> tags if present
+        output_content = self.extract_output_tag(content)
+        
         # Try to find JSON block
-        json_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
+        json_match = re.search(r'```json\s*(\{.*?\})\s*```', output_content, re.DOTALL)
         if json_match:
             try:
                 return json.loads(json_match.group(1))
@@ -233,7 +191,7 @@ class AgentWorkflowGraph:
         
         # Try to parse entire content as JSON
         try:
-            return json.loads(content)
+            return json.loads(output_content)
         except json.JSONDecodeError:
             logger.warning("Failed to parse JSON from response")
             return None
@@ -286,13 +244,15 @@ class AgentWorkflowGraph:
         Generate a workflow based on agent guidance (TRAINABLE NODE).
         
         This is called by generate_workflow_1/2/3 in parallel.
+        Each workflow_id gets a different variation strategy to ensure diversity.
         """
-        logger.info(f"[Workflow Node {workflow_id}] Generating workflow...")
+        logger.info(f"[Workflow Node {workflow_id}] Generating workflow with variation strategy {workflow_id}...")
         
         prompt = WORKFLOW_GENERATION_PROMPT.invoke({ # type: ignore
             "task": state["task"],
             "agent_output": state["agent_output"],
             "workflow_id": workflow_id,
+            "variation_strategy": get_variation_strategy(workflow_id),
         })
         
         result = self.invoke_prompt(prompt)
@@ -436,7 +396,7 @@ class AgentWorkflowGraph:
 # Agent-Lightning Integration
 # ============================================================================
 
-class LitWorkflowAgent(agentlightning.LitAgent[Any]):
+class LitWorkflowAgent(agentlightning.LitAgent): # type: ignore
     """
     Agent-Lightning wrapper for the Agent-Workflow graph.
     
@@ -613,10 +573,10 @@ class LitWorkflowAgent(agentlightning.LitAgent[Any]):
 # # Main Entry Point
 # # ============================================================================
 
-# if __name__ == "__main__":
-#     dotenv.load_dotenv()
-#     agent, trainer = agentlightning.lightning_cli(
-#         LitWorkflowAgent, agentlightning.Trainer
-#     )
-#     trainer.fit(agent, os.environ["VERL_API_BASE"], dev_data=dev_data())
+if __name__ == "__main__":
+    dotenv.load_dotenv()
+    agent, trainer = agentlightning.lightning_cli(
+        LitWorkflowAgent, agentlightning.Trainer
+    )
+    trainer.fit(agent, os.environ["VERL_API_BASE"])
 

@@ -2,19 +2,20 @@
 
 set -e
 
-export N_GPUS=1
+export N_GPUS=4
 export BASE_MODEL=Qwen/Qwen2.5-Coder-1.5B-Instruct
 export DATA_DIR=data
 export ROLLOUT_TP_SIZE=1
-export EXPERIMENT_NAME=spider
+export EXPERIMENT_NAME=workflow_agent
 export PROJECT_NAME=AgentLightning
+
 
 echo "Starting training script..."
 
 python -m agentlightning.verl \
     algorithm.adv_estimator=grpo \
-    data.train_files=${DATA_DIR}/train_spider.parquet \
-    data.val_files=${DATA_DIR}/test_dev_500.parquet \
+    data.train_files=${DATA_DIR}/train.parquet \
+    data.val_files=${DATA_DIR}/val.parquet \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
     trainer.n_gpus_per_node=${N_GPUS} \
     data.train_batch_size=32 \

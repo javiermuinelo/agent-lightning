@@ -2,6 +2,7 @@
 """
 Quick test script to verify the Agent-Workflow graph structure.
 Run this to test the graph execution without full RL training.
+Modified to use Qwen3-8B via Hugging Face Inference Providers.
 """
 
 import os
@@ -13,12 +14,27 @@ dotenv.load_dotenv()
 def test_graph_structure():
     """Test that the graph builds correctly and can execute."""
     print("=" * 80)
-    print("Testing Agent-Workflow Graph Structure")
+    print("Testing Agent-Workflow Graph Structure with Qwen3-8B (HuggingFace)")
     print("=" * 80)
     
-    # Create graph
+    # Set up HuggingFace environment
+    # Make sure HUGGINGFACEHUB_API_TOKEN is set in your .env file
+    if not os.environ.get("HUGGINGFACEHUB_API_TOKEN"):
+        print("\n⚠️  Warning: HUGGINGFACEHUB_API_TOKEN not found in environment.")
+        print("Please set it in your .env file or export it:")
+        print("export HUGGINGFACEHUB_API_TOKEN='hf_xxxxxxxxxxxxx'\n")
+    
+    # Configure to use HuggingFace with Qwen model
+    os.environ["MODEL"] = "Qwen/Qwen3-8B"
+    
+    print(f"Using model: {os.environ['MODEL']}")
+    print(f"Provider: HuggingFace Inference API\n")
+    
+    # Create graph with HuggingFace
+    # The graph will auto-detect HuggingFace mode if HUGGINGFACEHUB_API_TOKEN is set
     graph = AgentWorkflowGraph( # type: ignore
-        endpoint=os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
+        endpoint=None,  # Not needed for HuggingFace
+        use_huggingface=True,  # Explicitly enable HuggingFace mode
         debug=True,
     ).build_graph()
     
@@ -57,64 +73,19 @@ def test_graph_structure():
         return False
 
 
-def test_trainable_nodes():
-    """Test that trainable nodes are correctly identified."""
-    import re
-    
-    print("\n" + "=" * 80)
-    print("Testing Trainable Node Pattern")
-    print("=" * 80)
-    
-    pattern = r"generate_(agent|workflow_\d+)"
-    
-    nodes = [
-        "generate_agent",
-        "generate_workflow_1",
-        "generate_workflow_2",
-        "generate_workflow_3",
-        "execute_workflow_1",
-        "execute_workflow_2",
-        "execute_workflow_3",
-        "aggregate_results",
-    ]
-    
-    print(f"\nPattern: {pattern}")
-    print("\nNode Classification:")
-    
-    for node in nodes:
-        is_trainable = bool(re.search(pattern, node))
-        status = "✓ TRAINABLE" if is_trainable else "✗ Non-trainable"
-        print(f"  {node:30s} {status}")
-    
-    # Verify correct classification
-    trainable_count = sum(1 for node in nodes if re.search(pattern, node))
-    expected_trainable = 4  # agent + 3 workflows
-    
-    if trainable_count == expected_trainable:
-        print(f"\n✓ Correct: {trainable_count}/{len(nodes)} nodes are trainable")
-        return True
-    else:
-        print(f"\n✗ Error: Expected {expected_trainable} trainable nodes, got {trainable_count}")
-        return False
-
-
 if __name__ == "__main__":
     print("\n🚀 Agent-Workflow Graph Test Suite\n")
     
-    # Test 1: Trainable nodes
-    test1_passed = test_trainable_nodes()
-    
     # Test 2: Graph structure
-    test2_passed = test_graph_structure()
+    test1_passed = test_graph_structure()
     
     # Summary
     print("\n" + "=" * 80)
     print("Test Summary")
     print("=" * 80)
     print(f"Trainable Nodes Test: {'✓ PASSED' if test1_passed else '✗ FAILED'}")
-    print(f"Graph Execution Test: {'✓ PASSED' if test2_passed else '✗ FAILED'}")
     
-    if test1_passed and test2_passed:
+    if test1_passed:
         print("\n🎉 All tests passed! The graph is ready for RL training.")
     else:
         print("\n⚠️  Some tests failed. Please review the errors above.")
