@@ -436,20 +436,54 @@ LLM_JUDGE_PROMPT = ChatPromptTemplate(
         (
             "system",
             """
-You are an objective evaluator comparing workflow-generated answers against ground truth.
+You are an objective evaluator assessing a workflow-generated solution across multiple dimensions.
 
-Your task is to determine whether each workflow's answer is correct or incorrect by comparing it to the ground truth answer.
+Your task is to evaluate a single workflow on three criteria: correctness, efficiency, and quality.
 
-## Evaluation Guidelines ##
+## Evaluation Criteria ##
 
-0. **Numerical Tolerance**: For numerical answers, allow for small floating point differences (< 0.01)
-1. **Format Flexibility**: Accept answers in different formats if they represent the same value (e.g., "1/2" vs "0.5")
-2. **Strict by Default**: If unsure, mark as incorrect (0)
+### 1. CORRECTNESS (0 or 1)
+Evaluate whether the workflow's final answer matches the ground truth.
 
-## Scoring ##
-
+**Guidelines**:
 - Score 1: Answer is correct (matches ground truth)
 - Score 0: Answer is incorrect or missing
+- **Numerical Tolerance**: For numerical answers, allow for small floating point differences (< 0.01)
+- **Format Flexibility**: Accept answers in different formats if they represent the same value (e.g., "1/2" vs "0.5")
+- **Strict by Default**: If unsure, mark as incorrect (0)
+
+### 2. EFFICIENCY (0-10)
+Evaluate the workflow's computational efficiency and design economy.
+
+**Consider**:
+- **Graph Complexity**: How many nodes and edges? Simpler is better if it accomplishes the task
+- **Unnecessary Steps**: Are there redundant operations or overly complex decompositions?
+- **Parallelization**: Does it leverage parallel execution opportunities effectively?
+- **Direct vs. Indirect**: Does it solve the problem directly or take unnecessary detours?
+
+**Scoring Scale**:
+- 9-10: Highly efficient -  optimal structure, good parallelization
+- 7-8: Efficient - reasonable complexity, some optimization opportunities
+- 5-6: Moderate - average complexity, neither efficient nor wasteful
+- 3-4: Inefficient - unnecessary complexity, missed optimization opportunities
+- 0-2: Very inefficient - bloated graph, many redundant steps
+
+### 3. QUALITY (0-10)
+Evaluate the workflow’s reasoning fidelity and intermediate-step validity.
+
+**Consider**:
+- **Step Correctness**: Do intermediate sub-results and derived facts appear correct?
+- **Verification**: Are sub-steps validated (self-checks, constraints, quick tests)?
+- **Error Containment**: Are failures detected and contained early?
+- **Faithfulness**: Are steps necessary and consistent with the stated plan (no unjustified leaps)?
+- **Signal Propagation**: Are intermediate outputs well-formed and usable by later steps?
+
+**Scoring Scale**:
+- 9-10: Steps consistently correct/validated; failures handled; faithful, reliable chain
+- 7-8: Mostly correct steps with occasional gaps; some validation present
+- 5-6: Mixed correctness; limited validation; some brittle transitions
+- 3-4: Frequent incorrect steps; little/no validation; fragile reasoning chain
+- 0-2: Steps largely incorrect or ungrounded; reasoning not credible
 
 ## Output Format ##
 
@@ -457,14 +491,13 @@ You MUST respond with a valid JSON object in this exact format:
 
 ```json
 {{
-  "workflow_1": 0,
-  "workflow_2": 1,
-  "workflow_3": 0
+  "correctness": int,
+  "efficiency": float,
+  "quality": float
 }}
 ```
 
-Do NOT include any explanations or additional text outside the JSON object.
-Do NOT hardcode a response inside the graph code, use output parsing or LLMs to fill the final_answer field
+Provide ONLY the JSON object with no additional explanations or text.
 """.strip(),
         ),
         (
@@ -473,12 +506,12 @@ Do NOT hardcode a response inside the graph code, use output parsing or LLMs to 
 
 Ground Truth Answer: {ground_truth}
 
-Workflow Answers:
-- Workflow 1: {workflow_1_answer}
-- Workflow 2: {workflow_2_answer}
-- Workflow 3: {workflow_3_answer}
+Workflow Result:
+{workflow_result}
 
-Evaluate each workflow answer against the ground truth and provide scores (0 or 1) in JSON format.""",
+Workflow Answer: {workflow_answer}
+
+Evaluate this workflow on the three dimensions (correctness, efficiency, quality) and provide scores in JSON format.""",
         ),
     ]
 )

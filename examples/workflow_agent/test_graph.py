@@ -21,7 +21,7 @@ def test_graph_structure():
     # Make sure HUGGINGFACEHUB_API_TOKEN is set in your .env file
 
 
-    os.environ["HUGGINGFACEHUB_API_TOKEN"] = ""
+
     if not os.environ.get("HUGGINGFACEHUB_API_TOKEN"):
         print("\n⚠️  Warning: HUGGINGFACEHUB_API_TOKEN not found in environment.")
         print("Please set it in your .env file or export it:")

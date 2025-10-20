@@ -11,7 +11,6 @@ This module implements a hierarchical policy where:
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from typing import Any, Dict, Optional, cast
@@ -24,6 +23,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+from workflow_utils import *
 
 import agentlightning
 from agentlightning.types import Rollout
@@ -222,54 +222,7 @@ class AgentWorkflowGraph:
         
         return result # type: ignore
 
-    def extract_output_tag(self, content: str) -> str:
-        """Extract content from <output> tags if present, otherwise return full content."""
-        import re
-        
-        # Try to find content within <output> tags
-        output_match = re.search(r'<output>\s*(.*?)\s*</output>', content, re.DOTALL | re.IGNORECASE)
-        if output_match:
-            return output_match.group(1)
-        
-        return content
     
-    def parse_json_response(self, content: str) -> Optional[Dict[str, Any]]:
-        """Extract and parse JSON from LLM response (looks in <output> tags first)."""
-        import re
-        
-        # First, extract content from <output> tags if present
-        output_content = self.extract_output_tag(content)
-        
-        # Try to find JSON block
-        json_match = re.search(r'```json\s*(\{.*?\})\s*```', output_content, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-        
-        # Try to parse entire content as JSON
-        try:
-            return json.loads(output_content)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse JSON from response")
-            return None
-    
-    def parse_python_code(self, content: str) -> Optional[str]:
-        """Extract Python code from LLM response (looks in <output> tags first)."""
-        import re
-        
-        # First, extract content from <output> tags if present
-        output_content = self.extract_output_tag(content)
-        
-        # Try to find Python code block
-        python_match = re.search(r'```python\s*(.*?)\s*```', output_content, re.DOTALL)
-        if python_match:
-            return python_match.group(1).strip()
-        
-        # If no code block found, return None
-        logger.warning("Failed to extract Python code from response")
-        return None
     
     # ========================================================================
     # Graph Nodes (Trainable: generate_agent, generate_workflow_*)
@@ -304,7 +257,7 @@ class AgentWorkflowGraph:
         
         result = self.invoke_prompt(prompt)
         agent_output = result.content # type: ignore
-        agent_output_parsed = self.parse_json_response(agent_output)    # type: ignore
+        agent_output_parsed = parse_json_response(agent_output)    # type: ignore
         
         logger.info(f"[Agent Node] Generated agent output: {agent_output[:100]}...")
         
@@ -396,7 +349,7 @@ class AgentWorkflowGraph:
         workflow_content = state[key] # type: ignore
         
         # Parse Python code from the workflow output
-        workflow_code = self.parse_python_code(workflow_content) # type: ignore
+        workflow_code = parse_python_code(workflow_content) # type: ignore
         
         if workflow_code is None:
             logger.error(f"[Execute {workflow_id}] Failed to parse Python code from workflow")
@@ -440,21 +393,80 @@ class AgentWorkflowGraph:
             final_answer_key: final_answer,
         }
 
+    def evaluate_single_workflow(
+        self, workflow_id: int, task: str, ground_truth: str, state: WorkflowState
+    ) -> float:
+        """
+        Evaluate a single workflow with multi-dimensional scoring.
+        
+        This method is designed to be called in parallel for multiple workflows.
+        
+        Returns:
+            Composite score in range [0.0, 1.0]
+        """
+        answer_key = f"workflow_{workflow_id}_final_answer"
+        result_key = f"workflow_{workflow_id}_result"
+        
+        # Get workflow data
+        workflow_answer = state.get(answer_key) or "No answer provided"
+        workflow_result = state.get(result_key) or "Error on workflow result"
+        
+        # Create judge prompt for this specific workflow
+        prompt = LLM_JUDGE_PROMPT.invoke({ # type: ignore
+            "task": task,
+            "ground_truth": ground_truth,
+            "workflow_result": workflow_result,
+            "workflow_answer": workflow_answer,
+        })
+        
+        # Invoke LLM judge for this workflow
+        try:
+            result = self.invoke_prompt(prompt)
+            judge_response = result.content # type: ignore
+            logger.info(f"[Aggregate] Workflow {workflow_id} judge response: {judge_response[:150]}...")
+            
+            # Parse multi-dimensional scores
+            scores = parse_judge_scores(judge_response) # type: ignore
+            correctness = scores["correctness"]
+            efficiency = scores["efficiency"]
+            quality = scores["quality"]
+            
+            # Compute composite score
+            composite_score = compute_composite_score(correctness, efficiency, quality)
+            
+            logger.info(
+                f"[Aggregate] Workflow {workflow_id} - "
+                f"Correctness: {correctness:.0f}, "
+                f"Efficiency: {efficiency:.1f}/10, "
+                f"Quality: {quality:.1f}/10, "
+                f"Composite: {composite_score:.3f}"
+            )
+            
+            return composite_score
+            
+        except Exception as e:
+            logger.error(f"[Aggregate] Error evaluating workflow {workflow_id}: {e}")
+            return 0.0
+
     def aggregate_results(self, state: WorkflowState) -> Dict[str, Any]:
         """
         Aggregate results from all workflows using LLM-as-a-judge (NON-TRAINABLE).
         
-        Uses an LLM to evaluate each workflow's final answer against the ground truth,
-        then selects the best workflow based on scores.
-        """
-        logger.info("[Aggregate] Evaluating workflow answers with LLM judge...")
+        Uses an LLM to evaluate each workflow individually across three dimensions:
+        - Correctness (0 or 1): Binary check against ground truth
+        - Efficiency (0-10): Workflow complexity and design economy
+        - Quality (0-10): Code quality and software engineering practices
         
-        # Collect final answers and ground truth
+        Then computes composite scores using weighted formula:
+        score = 0.5 * correctness + 0.2 * (efficiency/10) + 0.3 * (quality/10)
+        
+        Evaluates all three workflows IN PARALLEL for efficiency.
+        """
+        logger.info("[Aggregate] Evaluating workflows with multi-dimensional LLM judge (in parallel)...")
+        
+        # Collect data for evaluation
         task = state["task"]
         ground_truth = state.get("ground_truth")
-        workflow_1_answer = state.get("workflow_1_final_answer") or "No answer provided"
-        workflow_2_answer = state.get("workflow_2_final_answer") or "No answer provided"
-        workflow_3_answer = state.get("workflow_3_final_answer") or "No answer provided"
         
         # If no ground truth, return all zeros
         if not ground_truth:
@@ -468,44 +480,44 @@ class AgentWorkflowGraph:
                 "agent_reward": 0.0,
             }
         
-        # Create judge prompt
-        prompt = LLM_JUDGE_PROMPT.invoke({ # type: ignore
-            "task": task,
-            "ground_truth": ground_truth,
-            "workflow_1_answer": workflow_1_answer,
-            "workflow_2_answer": workflow_2_answer,
-            "workflow_3_answer": workflow_3_answer,
-        })
+        # Evaluate all three workflows in parallel using ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        # Invoke LLM judge
-        try:
-            result = self.invoke_prompt(prompt)
-            judge_response = result.content # type: ignore
-            logger.info(f"[Aggregate] Judge response: {judge_response[:200]}...")
-            
-            # Parse JSON response
-            scores_dict = self.parse_json_response(judge_response) # type: ignore
-            
-            if scores_dict is None:
-                logger.warning("[Aggregate] Failed to parse judge response, defaulting to zeros")
-                scores_dict = {"workflow_1": 0, "workflow_2": 0, "workflow_3": 0}
-            
-            # Extract scores (ensure they are 0 or 1)
-            workflow_1_score = float(scores_dict.get("workflow_1", 0))
-            workflow_2_score = float(scores_dict.get("workflow_2", 0))
-            workflow_3_score = float(scores_dict.get("workflow_3", 0))
-            
-        except Exception as e:
-            logger.error(f"[Aggregate] Error invoking LLM judge: {e}")
-            workflow_1_score = 0.0
-            workflow_2_score = 0.0
-            workflow_3_score = 0.0
+        workflow_scores = [0.0, 0.0, 0.0]
         
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            # Submit all three evaluation tasks
+            future_to_id = {
+                executor.submit(
+                    self.evaluate_single_workflow, workflow_id, task, ground_truth, state
+                ): workflow_id
+                for workflow_id in [1, 2, 3]
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_id):
+                workflow_id = future_to_id[future]
+                try:
+                    score = future.result()
+                    workflow_scores[workflow_id - 1] = score
+                except Exception as e:
+                    logger.error(f"[Aggregate] Exception in parallel evaluation of workflow {workflow_id}: {e}")
+                    workflow_scores[workflow_id - 1] = 0.0
+        
+        # Extract individual scores
+        workflow_1_score = workflow_scores[0]
+        workflow_2_score = workflow_scores[1]
+        workflow_3_score = workflow_scores[2]
         
         # Compute agent-level reward as average of all workflows
         agent_reward = (workflow_1_score + workflow_2_score + workflow_3_score) / 3.0
         
-        logger.info(f"[Aggregate] Scores - W1: {workflow_1_score:.1f}, W2: {workflow_2_score:.1f}, W3: {workflow_3_score:.1f}")
+        logger.info(
+            f"[Aggregate] Final Scores - "
+            f"W1: {workflow_1_score:.3f}, "
+            f"W2: {workflow_2_score:.3f}, "
+            f"W3: {workflow_3_score:.3f}"
+        )
         logger.info(f"[Aggregate] Agent reward (avg): {agent_reward:.3f}")
         
         # Add agent and workflows to bucket manager if available
