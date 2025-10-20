@@ -1,5 +1,10 @@
 import json
 from typing import Any, Dict, Optional
+import ast
+import io
+import multiprocessing as mp
+from contextlib import redirect_stdout
+import resource  
 
 def extract_output_tag(content: str) -> str:
     """Extract content from <output> tags if present, otherwise return full content."""
@@ -92,3 +97,143 @@ def compute_composite_score(correctness: float, efficiency: float, quality: floa
         Composite score in range [0.0, 1.0]
     """
     return 0.5 * correctness + 0.2 * (efficiency / 10.0) + 0.3 * (quality / 10.0)
+
+
+# ============================
+# Safe Python Execution Utils
+# ============================
+
+_DISALLOWED_AST_NODES = (
+    ast.Import,
+    ast.ImportFrom,
+    ast.Attribute,  # prevents obj.__dict__ style escapes in most cases
+    ast.Global,
+    ast.Nonlocal,
+    ast.Lambda,
+    ast.With,
+    ast.AsyncWith,
+    ast.Try,
+    ast.Raise,
+    ast.Yield,
+    ast.YieldFrom,
+    ast.Await,
+)
+
+
+def sanitize_python_code(code: str) -> None:
+    """Parse and validate Python code disallowing dangerous constructs.
+
+    Raises a ValueError if disallowed nodes are detected.
+    """
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as e:  # pragma: no cover
+        raise ValueError(f"Invalid Python syntax: {e}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, _DISALLOWED_AST_NODES):
+            raise ValueError(f"Disallowed Python construct: {type(node).__name__}")
+        # Disallow calling __import__ directly via Name
+        if isinstance(node, ast.Name) and node.id == "__import__":
+            raise ValueError("Use of __import__ is disallowed")
+
+
+def _executor_worker(code: str, input_vars: Dict[str, Any] | None, memory_limit_mb: int, queue: "mp.Queue[Dict[str, Any]]") -> None:
+    """Worker to execute code in a restricted environment and send back results."""
+    # Apply resource limits (if available and on POSIX)
+    try:
+        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        max_bytes = memory_limit_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (max_bytes, hard))
+    except Exception:
+        pass
+
+    try:
+        # Limit CPU time to prevent runaway code (2 sec hard limit)
+        resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
+    except Exception:
+        pass
+
+    safe_builtins = {
+        "abs": abs,
+        "min": min,
+        "max": max,
+        "sum": sum,
+        "range": range,
+        "len": len,
+        "enumerate": enumerate,
+        "sorted": sorted,
+        "all": all,
+        "any": any,
+        "round": round,
+    }
+
+    globals_dict = {
+        "__builtins__": safe_builtins,
+    }
+
+    locals_dict: Dict[str, Any] = {}
+    if input_vars:
+        # Ensure we don't allow overriding globals/builtins keys
+        for k, v in input_vars.items():
+            if k in ("__builtins__",):
+                continue
+            locals_dict[k] = v
+
+    stdout_capture = io.StringIO()
+    error: str | None = None
+    result_value: Any = None
+
+    try:
+        with redirect_stdout(stdout_capture):
+            exec(code, globals_dict, locals_dict)
+        # Convention: if snippet assigns a variable named 'result', return it
+        result_value = locals_dict.get("result")
+    except Exception as e:  # pragma: no cover
+        error = f"{type(e).__name__}: {e}"
+
+    queue.put({
+        "result": result_value,
+        "stdout": stdout_capture.getvalue(),
+        "error": error,
+    })
+
+
+def execute_python_code(
+    code: str,
+    input_vars: Dict[str, Any] | None = None,
+    timeout_s: float = 2.0,
+    memory_limit_mb: int = 128,
+) -> Dict[str, Any]:
+    """Execute sanitized Python code in a separate process with basic sandboxing.
+
+    Returns a dict with keys: result, stdout, error.
+    The snippet can set a variable named `result` to pass back a value.
+    """
+    sanitize_python_code(code)
+
+    ctx = mp.get_context("spawn")
+    queue: "mp.Queue[Dict[str, Any]]" = ctx.Queue()  # type: ignore
+    proc = ctx.Process(target=_executor_worker, args=(code, input_vars or {}, memory_limit_mb, queue))
+    proc.daemon = True
+    proc.start()
+
+    proc.join(timeout_s)
+    if proc.is_alive():
+        try:
+            proc.terminate()
+        finally:
+            proc.join(0.1)
+        return {"result": None, "stdout": "", "error": f"Timeout after {timeout_s}s"}
+
+    try:
+        payload = queue.get_nowait()
+    except Exception:  # pragma: no cover
+        payload = {"result": None, "stdout": "", "error": "No output captured"}
+
+    # Ensure shape
+    return {
+        "result": payload.get("result"),
+        "stdout": payload.get("stdout", ""),
+        "error": payload.get("error"),
+    }

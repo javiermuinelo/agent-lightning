@@ -16,6 +16,7 @@ from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import Literal, TypedDict, Annotated
+from workflow_utils import parse_python_code, execute_python_code 
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -82,6 +83,9 @@ def execute_workflow(
         "os": os,
         "Dict": Dict,
         "Any": Any,
+        # Utils exposed for workflows
+        "parse_python_code": parse_python_code,
+        "execute_python_code": execute_python_code,
     }
     
     # Execute the workflow code

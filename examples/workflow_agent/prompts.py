@@ -245,8 +245,11 @@ Your role is to take the strategic planning and task decomposition provided by t
 
 **CRITICAL - Answer Formatting**:
 - Your State definition MUST include a `final_answer: str` field
-- The final node in your workflow MUST populate this field with the answer
-- Example: `return {{"final_answer": "A"}}` or `state["final_answer"] = "42"`
+- The final node in your workflow MUST populate this field with the DYNAMICALLY COMPUTED answer
+- The answer should be derived from workflow execution, LLM outputs, or computed from state fields
+- Example: `return {{"final_answer": computed_result}}` or `return {{"final_answer": response.content}}`
+- Example: `answer = llm.invoke([{{"role": "user", "content": f"Based on {{analysis}}, what is the final answer?"}}]); return {{"final_answer": answer.content}}`
+- DO NOT hardcode literal answers - the answer must come from the workflow's computation
 - This field will be used for automated evaluation against ground truth
 
 **LLM Access**:
@@ -261,6 +264,13 @@ Your role is to take the strategic planning and task decomposition provided by t
       analysis = response.content
       return {{"analysis": analysis}}
   ```
+
+**Python Execution**:
+- You MAY embed Python code as a tool in fenced ```python blocks inside nodes
+- Extract code with `parse_python_code(text)` and run with `execute_python_code(code, input_vars=None)`
+- The executor returns a dict: `{{ "result": Any | None, "stdout": str, "error": str | None }}`
+- Set a variable named `result` in your snippet to return a value
+- Imports are disallowed; only simple built-ins (e.g., sum, range, len, min/max, sorted, enumerate, all, any, round) are available
 
 ## Output Format ##
 
@@ -313,11 +323,20 @@ def node_1(state: State) -> dict:
     return {{"field1": result}}
 
 def node_2(state: State) -> dict:
-    \"\"\"Description of node 2\"\"\"
-    # Implementation here
-    # Can access previous results and call llm if needed
+    \"\"\"
+    Example node that uses Python execution and returns final answer.
+    \"\"\"
     field1_value = state["field1"]
-    return {{"field2": result}}
+    
+    # Example 1: Use LLM to generate answer based on accumulated state
+    response = llm.invoke([{{"role": "user", "content": f"Based on {{field1_value}}, what is the answer?"}}])
+    return {{"final_answer": response.content}}
+    
+    # Example 2: Execute Python code and return result as answer
+    # response = llm.invoke([{{"role": "user", "content": "Write a python snippet that computes something based on the input. Set `result` to your computed value."}}])
+    # code = parse_python_code(response.content)
+    # out = execute_python_code(code, input_vars={{"data": field1_value}})
+    # return {{"final_answer": str(out["result"])}}
 
 # Add more nodes as needed based on agent decomposition
 
@@ -369,7 +388,7 @@ graph = graph_builder.compile()
 - **Clear I/O**: Document what each node reads from and writes to state
 - **Error handling**: Consider edge cases identified by the agent
 - **Modularity**: Keep nodes focused and independently testable
-- **REQUIRED - Final Answer Field**: The workflow MUST include a `final_answer: str` field in the State definition, and the final node must populate it with the answer. This is required for automated scoring. Example: `return {{"final_answer": "D"}}` or `final_answer = "42"` in the last node.
+- **REQUIRED - Final Answer Field**: The workflow MUST include a `final_answer: str` field in the State definition, and the final node must populate it with the DYNAMICALLY COMPUTED answer. The answer should be derived from LLM outputs, computed from state fields, or parsed from structured outputs. DO NOT use hardcoded literal values. Example: `return {{"final_answer": result}}` where result comes from computation, or `return {{"final_answer": llm_response.content}}`.
 
 ### Graph Topology
 - **Follow dependencies**: Respect the agent's dependency map strictly
@@ -421,7 +440,7 @@ First, in <plan> tags, think through:
 4. Are there any conditional branches or parallel opportunities?
 5. What trade-offs does my chosen approach involve?
 
-Then, in <output> tags, provide the complete Python workflow code. Remember to include `final_answer: str` in your State definition, and the final node MUST populate this field with the answer. Example: `return {{"final_answer": "D"}}`.""", 
+Then, in <output> tags, provide the complete Python workflow code. Remember to include `final_answer: str` in your State definition, and the final node MUST populate this field with the DYNAMICALLY COMPUTED answer from workflow execution (e.g., from LLM output, computed values, or parsed structured data). DO NOT use hardcoded literal values.""", 
         ),
     ]
 )
