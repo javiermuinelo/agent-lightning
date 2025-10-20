@@ -22,6 +22,7 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
+from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 
 import agentlightning
 from agentlightning.types import Rollout
@@ -34,8 +35,23 @@ logger = agentlightning.configure_logger(name=__name__)
 from prompts import (
     AGENT_GENERATION_PROMPT,
     WORKFLOW_GENERATION_PROMPT,
+    LLM_JUDGE_PROMPT,
     get_variation_strategy,
 )
+
+# Import workflow executor
+from workflow_executor import execute_workflow
+
+
+# ============================================================================
+# Helper Classes
+# ============================================================================
+
+class SimpleMessage:
+    """Simple message wrapper for HuggingFace responses."""
+    
+    def __init__(self, content: str) -> None:
+        self.content = content
 
 
 # ============================================================================
@@ -47,6 +63,7 @@ class WorkflowState(TypedDict):
     
     # Input
     task: str
+    ground_truth: Optional[str]  # Ground truth answer for scoring
     
     # Agent generation
     agent_output: str
@@ -61,6 +78,11 @@ class WorkflowState(TypedDict):
     workflow_1_result: Optional[Any]
     workflow_2_result: Optional[Any]
     workflow_3_result: Optional[Any]
+    
+    # Final answers from workflows
+    workflow_1_final_answer: Optional[str]
+    workflow_2_final_answer: Optional[str]
+    workflow_3_final_answer: Optional[str]
     
     # Scores (placeholder for now)
     workflow_1_score: Optional[float]
@@ -110,15 +132,20 @@ class AgentWorkflowGraph:
             
             logger.info(f"Initializing HuggingFace model: {self.model_name}")
             
-            # Use init_chat_model with huggingface provider - handles prompt formatting automatically!
-            self.llm = init_chat_model(
-                self.model_name,
-                model_provider="huggingface",
+            # Use HuggingFaceEndpoint directly - this is the correct approach
+            
+            self.llm = ChatHuggingFace(llm=HuggingFaceEndpoint(
+                model=self.model_name,  # Use model parameter instead of repo_id
+                # repo_id="deepseek-ai/DeepSeek-R1-0528",
+                task="text-generation",
                 huggingfacehub_api_token=os.environ.get("HUGGINGFACEHUB_API_TOKEN"),
                 temperature=temperature,
-                max_tokens=2048,
-                max_retries=max_retries,
-            )
+                max_new_tokens=32768,
+                top_k=50,
+                top_p=0.95,
+                repetition_penalty=1.03,
+                provider="nscale",  # Let HuggingFace choose the best provider
+            ))
             
         elif verl_replacement is not None:
             # Use OpenAI-compatible endpoint (for VERL training)
@@ -131,7 +158,7 @@ class AgentWorkflowGraph:
                 openai_api_key=os.environ.get("OPENAI_API_KEY", "dummy"),
                 temperature=verl_replacement["temperature"],
                 max_retries=max_retries,
-                max_tokens=2048,
+                max_tokens=32768,
             )
         else:
             # Use standard OpenAI endpoint
@@ -143,23 +170,47 @@ class AgentWorkflowGraph:
                 openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
                 temperature=0.7,
                 max_retries=1,
-                max_tokens=2048,
+                max_tokens=32768,
             )
 
     def invoke_prompt(self, prompt: Any) -> AnyMessage:
         """Invoke LLM with prompt and handle errors."""
         if self.debug:
-            for message in prompt.messages:
-                print(f"[PROMPT] {message.content[:200]}...")
+            if hasattr(prompt, 'messages'):
+                for message in prompt.messages:
+                    print(f"[PROMPT] {message.content[:200]}...")
+            else:
+                print(f"[PROMPT] {str(prompt)[:200]}...")
         
         try:
-            result = self.llm.invoke(prompt)
+            # Check if we're using HuggingFace (which expects string input)
+            if hasattr(self.llm, 'repo_id'):  # HuggingFaceEndpoint has repo_id attribute
+                # Convert prompt to string for HuggingFace
+                if hasattr(prompt, 'messages'):
+                    prompt_text = "\n\n".join([msg.content for msg in prompt.messages if hasattr(msg, 'content')])
+                else:
+                    prompt_text = str(prompt)
+                
+                result_text = self.llm.invoke(prompt_text)
+                
+                # Use the global SimpleMessage class
+                result = SimpleMessage(str(result_text))
+            else:
+                # Standard LangChain interface
+                result = self.llm.invoke(prompt)
         except Exception as e:
             logger.error(f"Failed to invoke prompt: {e}")
-            result = self.llm.invoke([{"role": "user", "content": "Generate a simple workflow."}])
+            if hasattr(self.llm, 'repo_id'):  # HuggingFace
+                result_text = self.llm.invoke("Generate a simple workflow.")
+                result = SimpleMessage(str(result_text))
+            else:
+                result = self.llm.invoke([{"role": "user", "content": "Generate a simple workflow."}])
         
         if self.debug:
-            print(f"[RESPONSE] {result.content[:200]}...") # type: ignore
+            if hasattr(result, 'content'):
+                print(f"[RESPONSE] {result.content[:200]}...") # type: ignore
+            else:
+                print(f"[RESPONSE] {str(result)[:200]}...")
         
         return result # type: ignore
 
@@ -195,12 +246,28 @@ class AgentWorkflowGraph:
         except json.JSONDecodeError:
             logger.warning("Failed to parse JSON from response")
             return None
-
+    
+    def parse_python_code(self, content: str) -> Optional[str]:
+        """Extract Python code from LLM response (looks in <output> tags first)."""
+        import re
+        
+        # First, extract content from <output> tags if present
+        output_content = self.extract_output_tag(content)
+        
+        # Try to find Python code block
+        python_match = re.search(r'```python\s*(.*?)\s*```', output_content, re.DOTALL)
+        if python_match:
+            return python_match.group(1).strip()
+        
+        # If no code block found, return None
+        logger.warning("Failed to extract Python code from response")
+        return None
+    
     # ========================================================================
     # Graph Nodes (Trainable: generate_agent, generate_workflow_*)
     # ========================================================================
 
-    def generate_agent(self, state: WorkflowState) -> WorkflowState:
+    def generate_agent(self, state: WorkflowState) -> Dict[str, Any]:
         """
         Generate meta-agent specification (TRAINABLE NODE).
         
@@ -220,26 +287,25 @@ class AgentWorkflowGraph:
         logger.info(f"[Agent Node] Generated agent output: {agent_output[:100]}...")
         
         return { # type: ignore
-            **state,
             "agent_output": agent_output, # type: ignore
             "agent_output_parsed": agent_output_parsed,
         }
 
-    def generate_workflow_1(self, state: WorkflowState) -> WorkflowState:
+    def generate_workflow_1(self, state: WorkflowState) -> Dict[str, Any]:
         """Generate first workflow candidate (TRAINABLE NODE)."""
         return self._generate_workflow(state, workflow_id=1, key="workflow_1")
 
-    def generate_workflow_2(self, state: WorkflowState) -> WorkflowState:
+    def generate_workflow_2(self, state: WorkflowState) -> Dict[str, Any]:
         """Generate second workflow candidate (TRAINABLE NODE)."""
         return self._generate_workflow(state, workflow_id=2, key="workflow_2")
 
-    def generate_workflow_3(self, state: WorkflowState) -> WorkflowState:
+    def generate_workflow_3(self, state: WorkflowState) -> Dict[str, Any]:
         """Generate third workflow candidate (TRAINABLE NODE)."""
         return self._generate_workflow(state, workflow_id=3, key="workflow_3")
 
     def _generate_workflow(
         self, state: WorkflowState, workflow_id: int, key: str
-    ) -> WorkflowState:
+    ) -> Dict[str, Any]:
         """
         Generate a workflow based on agent guidance (TRAINABLE NODE).
         
@@ -251,7 +317,6 @@ class AgentWorkflowGraph:
         prompt = WORKFLOW_GENERATION_PROMPT.invoke({ # type: ignore
             "task": state["task"],
             "agent_output": state["agent_output"],
-            "workflow_id": workflow_id,
             "variation_strategy": get_variation_strategy(workflow_id),
         })
         
@@ -261,7 +326,6 @@ class AgentWorkflowGraph:
         logger.info(f"[Workflow Node {workflow_id}] Generated workflow: {workflow_output[:100]}...")
         
         return { # type: ignore
-            **state,
             key: workflow_output,
         }
 
@@ -269,77 +333,150 @@ class AgentWorkflowGraph:
     # Graph Nodes (Non-trainable: execution and aggregation)
     # ========================================================================
 
-    def execute_workflow_1(self, state: WorkflowState) -> WorkflowState:
+    def execute_workflow_1(self, state: WorkflowState) -> Dict[str, Any]:
         """Execute first workflow (NON-TRAINABLE)."""
         return self._execute_workflow(state, workflow_id=1, key="workflow_1")
 
-    def execute_workflow_2(self, state: WorkflowState) -> WorkflowState:
+    def execute_workflow_2(self, state: WorkflowState) -> Dict[str, Any]:
         """Execute second workflow (NON-TRAINABLE)."""
         return self._execute_workflow(state, workflow_id=2, key="workflow_2")
 
-    def execute_workflow_3(self, state: WorkflowState) -> WorkflowState:
+    def execute_workflow_3(self, state: WorkflowState) -> Dict[str, Any]:
         """Execute third workflow (NON-TRAINABLE)."""
         return self._execute_workflow(state, workflow_id=3, key="workflow_3")
 
     def _execute_workflow(
         self, state: WorkflowState, workflow_id: int, key: str
-    ) -> WorkflowState:
+    ) -> Dict[str, Any]:
         """
-        Execute a workflow and compute its score (PLACEHOLDER).
+        Execute a workflow and extract its final answer.
         
-        TODO: Implement actual workflow execution (Python/Mermaid interpreter)
-        TODO: Implement LLM-as-Judge scoring
+        Parses the Python code from the workflow output and executes it using
+        the workflow executor. Returns the result and extracted final_answer.
+        Scoring is deferred to aggregate_results.
         """
-        logger.info(f"[Execute {workflow_id}] Executing workflow (PLACEHOLDER)...")
+        logger.info(f"[Execute {workflow_id}] Executing workflow...")
         
         workflow_content = state[key] # type: ignore
         
-        # PLACEHOLDER: Random score for now
-        import random
-        score = random.uniform(0.3, 1.0)
+        # Parse Python code from the workflow output
+        workflow_code = self.parse_python_code(workflow_content) # type: ignore
+        
+        if workflow_code is None:
+            logger.error(f"[Execute {workflow_id}] Failed to parse Python code from workflow")
+            # Return error state
+            return { # type: ignore
+                f"{key}_result": None,
+                f"{key}_final_answer": None,
+            }
+        
+        # Execute the workflow using the executor
+        try:
+            result = execute_workflow(
+                workflow_code=workflow_code,
+                task=state["task"],
+                model_name=self.model_name,
+                temperature=0.7,
+            )
+            logger.info(f"[Execute {workflow_id}] Workflow executed successfully")
+            logger.info(f"[Execute {workflow_id}] Result: {str(result)}...")
+            
+            # Extract final_answer directly from workflow result
+            final_answer = result.get("final_answer")
+            if final_answer:
+                logger.info(f"[Execute {workflow_id}] Final answer: {final_answer}")
+            else:
+                logger.warning(f"[Execute {workflow_id}] No final_answer field found in result")
+            
+        except Exception as e:
+            logger.error(f"[Execute {workflow_id}] Workflow execution failed: {str(e)}")
+            # Return error state
+            return { # type: ignore
+                f"{key}_result": {"error": str(e), "workflow": workflow_content},
+                f"{key}_final_answer": None,
+            }
         
         result_key = f"workflow_{workflow_id}_result"
-        score_key = f"workflow_{workflow_id}_score"
-        
-        logger.info(f"[Execute {workflow_id}] Score: {score:.3f}")
+        final_answer_key = f"workflow_{workflow_id}_final_answer"
         
         return { # type: ignore
-            **state,
-            result_key: {"executed": True, "workflow": workflow_content},
-            score_key: score,
+            result_key: {"executed": True, "result": result, "workflow": workflow_content},
+            final_answer_key: final_answer,
         }
 
-    def aggregate_results(self, state: WorkflowState) -> WorkflowState:
+    def aggregate_results(self, state: WorkflowState) -> Dict[str, Any]:
         """
-        Aggregate results from all workflows and select the best (NON-TRAINABLE).
+        Aggregate results from all workflows using LLM-as-a-judge (NON-TRAINABLE).
+        
+        Uses an LLM to evaluate each workflow's final answer against the ground truth,
+        then selects the best workflow based on scores.
         """
-        logger.info("[Aggregate] Selecting best workflow...")
+        logger.info("[Aggregate] Evaluating workflow answers with LLM judge...")
         
-        scores = [
-            (1, state.get("workflow_1_score", 0.0), state.get("workflow_1")),
-            (2, state.get("workflow_2_score", 0.0), state.get("workflow_2")),
-            (3, state.get("workflow_3_score", 0.0), state.get("workflow_3")),
-        ]
+        # Collect final answers and ground truth
+        task = state["task"]
+        ground_truth = state.get("ground_truth")
+        workflow_1_answer = state.get("workflow_1_final_answer") or "No answer provided"
+        workflow_2_answer = state.get("workflow_2_final_answer") or "No answer provided"
+        workflow_3_answer = state.get("workflow_3_final_answer") or "No answer provided"
         
-        # Select best workflow
-        best_id, best_score, best_workflow = max(scores, key=lambda x: x[1]) # type: ignore
+        # If no ground truth, return all zeros
+        if not ground_truth:
+            logger.warning("[Aggregate] No ground truth provided, assigning zero scores")
+            return {
+                "workflow_1_score": 0.0,
+                "workflow_2_score": 0.0,
+                "workflow_3_score": 0.0,
+                "best_workflow": state.get("workflow_1"),
+                "final_score": 0.0,
+                "agent_reward": 0.0,
+            }
+        
+        # Create judge prompt
+        prompt = LLM_JUDGE_PROMPT.invoke({ # type: ignore
+            "task": task,
+            "ground_truth": ground_truth,
+            "workflow_1_answer": workflow_1_answer,
+            "workflow_2_answer": workflow_2_answer,
+            "workflow_3_answer": workflow_3_answer,
+        })
+        
+        # Invoke LLM judge
+        try:
+            result = self.invoke_prompt(prompt)
+            judge_response = result.content # type: ignore
+            logger.info(f"[Aggregate] Judge response: {judge_response[:200]}...")
+            
+            # Parse JSON response
+            scores_dict = self.parse_json_response(judge_response) # type: ignore
+            
+            if scores_dict is None:
+                logger.warning("[Aggregate] Failed to parse judge response, defaulting to zeros")
+                scores_dict = {"workflow_1": 0, "workflow_2": 0, "workflow_3": 0}
+            
+            # Extract scores (ensure they are 0 or 1)
+            workflow_1_score = float(scores_dict.get("workflow_1", 0))
+            workflow_2_score = float(scores_dict.get("workflow_2", 0))
+            workflow_3_score = float(scores_dict.get("workflow_3", 0))
+            
+        except Exception as e:
+            logger.error(f"[Aggregate] Error invoking LLM judge: {e}")
+            workflow_1_score = 0.0
+            workflow_2_score = 0.0
+            workflow_3_score = 0.0
+        
         
         # Compute agent-level reward as average of all workflows
-        workflow_scores = [
-            state.get("workflow_1_score") or 0.0,
-            state.get("workflow_2_score") or 0.0,
-            state.get("workflow_3_score") or 0.0,
-        ]
-        agent_reward = sum(workflow_scores) / 3.0
+        agent_reward = (workflow_1_score + workflow_2_score + workflow_3_score) / 3.0
         
-        logger.info(f"[Aggregate] Best workflow: {best_id} with score {best_score:.3f}")
+        logger.info(f"[Aggregate] Scores - W1: {workflow_1_score:.1f}, W2: {workflow_2_score:.1f}, W3: {workflow_3_score:.1f}")
         logger.info(f"[Aggregate] Agent reward (avg): {agent_reward:.3f}")
         
         return {
-            **state,
-            "best_workflow": best_workflow,
-            "final_score": best_score,
-            "agent_reward": agent_reward,  # NEW: Store agent reward explicitly
+            "workflow_1_score": workflow_1_score,
+            "workflow_2_score": workflow_2_score,
+            "workflow_3_score": workflow_3_score,
+            "agent_reward": agent_reward,
         }
 
     # ========================================================================
@@ -377,12 +514,12 @@ class AgentWorkflowGraph:
         builder.add_edge("generate_agent", "generate_workflow_2")
         builder.add_edge("generate_agent", "generate_workflow_3")
         
-        # Parallel workflow execution
+        # # Parallel workflow execution
         builder.add_edge("generate_workflow_1", "execute_workflow_1")
         builder.add_edge("generate_workflow_2", "execute_workflow_2")
         builder.add_edge("generate_workflow_3", "execute_workflow_3")
         
-        # Aggregate results
+        # # Aggregate results
         builder.add_edge("execute_workflow_1", "aggregate_results")
         builder.add_edge("execute_workflow_2", "aggregate_results")
         builder.add_edge("execute_workflow_3", "aggregate_results")

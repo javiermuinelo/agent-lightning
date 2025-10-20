@@ -190,6 +190,32 @@ Your role is to take the strategic planning and task decomposition provided by t
 6. **Ensure Executability**: Generate valid, runnable Python code
 7. **Consider Advanced Patterns**: Use complex graph strategies like voting, actor-critic, or ensemble methods when a subtask requires sophisticated decision making
 
+## Important Execution Details ##
+
+**Graph Entrypoint**:
+- The workflow will be invoked with a state containing a `task` field (string)
+- Your State definition MUST include `task: str` as a field
+- The graph receives: `{{"task": "the task description string"}}`
+
+**CRITICAL - Answer Formatting**:
+- Your State definition MUST include a `final_answer: str` field
+- The final node in your workflow MUST populate this field with the answer
+- Example: `return {{"final_answer": "A"}}` or `state["final_answer"] = "42"`
+- This field will be used for automated evaluation against ground truth
+
+**LLM Access**:
+- A global variable `llm` is available in the execution environment
+- You can call the LLM from any node to perform reasoning, generation, or other tasks
+- Calling convention: `llm.invoke([{{"role": "user", "content": "your prompt here"}}])`
+- Example usage in a node:
+  ```python
+  def analyze_input(state: State) -> dict:
+      task = state["task"]
+      response = llm.invoke([{{"role": "user", "content": f"Analyze this task: {{task}}"}}])
+      analysis = response.content
+      return {{"analysis": analysis}}
+  ```
+
 ## Output Format ##
 
 First, think through your implementation in <plan> tags, then provide your final Python code in <output> tags.
@@ -205,7 +231,13 @@ from langgraph.graph.message import add_messages
 
 # STATE DEFINITION
 class State(TypedDict):
-    # Define state fields based on what data needs to flow between nodes
+    # REQUIRED: task field to receive the input task string
+    task: str
+    
+    # REQUIRED: final_answer field to store the final answer for evaluation
+    final_answer: str
+    
+    # Define additional state fields based on what data needs to flow between nodes
     # Use Annotated types with reducers when appropriate (e.g., add_messages, append, etc.)
     field1: str
     field2: Annotated[list, add_messages]
@@ -217,6 +249,7 @@ class State(TypedDict):
 # - Take state as input
 # - Perform one well-defined operation
 # - Return a dict with updated state fields
+# - Can use the global `llm` variable to call an LLM for reasoning/generation
 
 def node_1(state: State) -> dict:
     \"\"\"
@@ -224,14 +257,21 @@ def node_1(state: State) -> dict:
     Input: What it reads from state
     Output: What it adds/updates in state
     \"\"\"
-    # Implementation here
-    result = ...
-    return {"field1": result}
+    # Access the task from state
+    task = state["task"]
+    
+    # Example: Call LLM if this node needs reasoning/generation
+    response = llm.invoke([{{"role": "user", "content": f"Process this task: {{task}}"}}])
+    result = response.content
+    
+    return {{"field1": result}}
 
 def node_2(state: State) -> dict:
     \"\"\"Description of node 2\"\"\"
     # Implementation here
-    return {"field2": result}
+    # Can access previous results and call llm if needed
+    field1_value = state["field1"]
+    return {{"field2": result}}
 
 # Add more nodes as needed based on agent decomposition
 
@@ -269,6 +309,7 @@ graph = graph_builder.compile()
 ## Guidelines ##
 
 ### State Design
+- **REQUIRED**: Include `task: str` as the first field (receives the input task)
 - Include all data that needs to flow between nodes
 - Use `Annotated[list, add_messages]` for message lists that should accumulate
 - Use descriptive field names that reflect the agent's terminology
@@ -276,9 +317,13 @@ graph = graph_builder.compile()
 
 ### Node Implementation
 - **One subtask per node**: Each node should implement exactly one subtask from the agent decomposition
+- **LLM Usage**: Use the global `llm` variable when a node needs reasoning, generation, or analysis
+  - Call with: `llm.invoke([{{"role": "user", "content": "your prompt"}}])`
+  - Access response content with: `response.content`
 - **Clear I/O**: Document what each node reads from and writes to state
 - **Error handling**: Consider edge cases identified by the agent
 - **Modularity**: Keep nodes focused and independently testable
+- **REQUIRED - Final Answer Field**: The workflow MUST include a `final_answer: str` field in the State definition, and the final node must populate it with the answer. This is required for automated scoring. Example: `return {{"final_answer": "D"}}` or `final_answer = "42"` in the last node.
 
 ### Graph Topology
 - **Follow dependencies**: Respect the agent's dependency map strictly
@@ -328,7 +373,64 @@ First, in <plan> tags, think through:
 4. Are there any conditional branches or parallel opportunities?
 5. What trade-offs does my chosen approach involve?
 
-Then, in <output> tags, provide the complete Python workflow code.""",
+Then, in <output> tags, provide the complete Python workflow code. Remember to include `final_answer: str` in your State definition, and the final node MUST populate this field with the answer. Example: `return {{"final_answer": "D"}}`.""", 
+        ),
+    ]
+)
+
+
+# ============================================================================
+# LLM Judge Prompt (for evaluating workflow answers)
+# ============================================================================
+
+LLM_JUDGE_PROMPT = ChatPromptTemplate(
+    [
+        (
+            "system",
+            """
+You are an objective evaluator comparing workflow-generated answers against ground truth.
+
+Your task is to determine whether each workflow's answer is correct or incorrect by comparing it to the ground truth answer.
+
+## Evaluation Guidelines ##
+
+0. **Numerical Tolerance**: For numerical answers, allow for small floating point differences (< 0.01)
+1. **Format Flexibility**: Accept answers in different formats if they represent the same value (e.g., "1/2" vs "0.5")
+2. **Strict by Default**: If unsure, mark as incorrect (0)
+
+## Scoring ##
+
+- Score 1: Answer is correct (matches ground truth)
+- Score 0: Answer is incorrect or missing
+
+## Output Format ##
+
+You MUST respond with a valid JSON object in this exact format:
+
+```json
+{{
+  "workflow_1": 0,
+  "workflow_2": 1,
+  "workflow_3": 0
+}}
+```
+
+Do NOT include any explanations or additional text outside the JSON object.
+Do NOT hardcode a response inside the graph code, use output parsing or LLMs to fill the final_answer field
+""".strip(),
+        ),
+        (
+            "user",
+            """Task: {task}
+
+Ground Truth Answer: {ground_truth}
+
+Workflow Answers:
+- Workflow 1: {workflow_1_answer}
+- Workflow 2: {workflow_2_answer}
+- Workflow 3: {workflow_3_answer}
+
+Evaluate each workflow answer against the ground truth and provide scores (0 or 1) in JSON format.""",
         ),
     ]
 )

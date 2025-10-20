@@ -19,6 +19,8 @@ def test_graph_structure():
     
     # Set up HuggingFace environment
     # Make sure HUGGINGFACEHUB_API_TOKEN is set in your .env file
+
+    os.environ["HUGGINGFACEHUB_API_TOKEN"] = ""
     if not os.environ.get("HUGGINGFACEHUB_API_TOKEN"):
         print("\n⚠️  Warning: HUGGINGFACEHUB_API_TOKEN not found in environment.")
         print("Please set it in your .env file or export it:")
@@ -47,7 +49,13 @@ def test_graph_structure():
     print("=" * 80)
     
     test_task = {
-        "task": "Write a Python function to calculate the Fibonacci sequence up to N numbers."
+        "task": """A reaction of a liquid organic compound, which molecules consist of carbon and hydrogen atoms, is performed at 80 centigrade and 20 bar for 24 hours. In the proton nuclear magnetic resonance spectrum, the signals with the highest chemical shift of the reactant are replaced by a signal of the product that is observed about three to four units downfield.
+Compounds from which position in the periodic system of the elements, which are also used in the corresponding large-scale industrial process, have been mostly likely initially added in small amounts?
+A) A metal compound from the fifth period.
+B) A metal compound from the fifth period and a non-metal compound from the third period.
+C) A metal compound from the fourth period.
+D) A metal compound from the fourth period and a non-metal compound from the second period.""",
+        "ground_truth": "D"
     }
     
     print(f"\nTask: {test_task['task']}")
@@ -57,12 +65,22 @@ def test_graph_structure():
         result = graph.invoke(test_task) # type: ignore
         
         print("\n✓ Graph executed successfully!")
-        print(f"\nAgent Output: {result['agent_output'][:200]}...")
-        print(f"\nWorkflow 1: {result['workflow_1'][:150]}..." if result['workflow_1'] else "None")
-        print(f"Workflow 2: {result['workflow_2'][:150]}..." if result['workflow_2'] else "None")
-        print(f"Workflow 3: {result['workflow_3'][:150]}..." if result['workflow_3'] else "None")
-        print(f"\nFinal Score: {result['final_score']:.3f}")
-        print(f"Best Workflow: {result['best_workflow'][:150]}..." if result['best_workflow'] else "None")
+        
+        # Save agent output to file
+        with open("agent_output.txt", "w") as f:
+            f.write(result['agent_output'])
+            
+        # Save each workflow output to separate files
+        for i in range(1, 4):
+            workflow_key = f'workflow_{i}'
+            if result.get(workflow_key):
+                with open(f"workflow_{i}_output.txt", "w") as f:
+                    f.write(f"Workflow {i} Output:\n")
+                    f.write(result[workflow_key])
+                    f.write(f"\n\nWorkflow {i} Result:\n")
+                    f.write(str(result.get(f'{workflow_key}_result', 'No result')))
+                    f.write(f"\n\nWorkflow {i} Score: {result.get(f'{workflow_key}_score', 0.0):.3f}")
+                    f.write(f"\nGround Truth: {result.get('ground_truth', 'N/A')}")
         
         return True
         
