@@ -61,6 +61,50 @@ def get_variation_strategy(workflow_id: int) -> str:
     )
 
 
+def format_agent_exemplars(exemplars: list[tuple[str, float]] | None) -> str:
+    """
+    Format agent exemplars for prompt injection.
+    
+    Args:
+        exemplars: List of (agent_output, score) tuples, or None
+        
+    Returns:
+        Formatted string to inject into prompt, or empty string if no exemplars
+    """
+    if exemplars is None or len(exemplars) == 0:
+        return ""
+    
+    lines = ["Here are some example agent analyses from previous tasks:\n"]
+    
+    for i, (agent_output, score) in enumerate(exemplars, 1):
+        lines.append(f"Example {i} (Score: {score:.3f}):")
+        lines.append(f"{agent_output}\n")
+    
+    return "\n".join(lines)
+
+
+def format_workflow_exemplars(exemplars: list[tuple[str, float]] | None) -> str:
+    """
+    Format workflow exemplars for prompt injection.
+    
+    Args:
+        exemplars: List of (workflow_output, score) tuples, or None
+        
+    Returns:
+        Formatted string to inject into prompt, or empty string if no exemplars
+    """
+    if exemplars is None or len(exemplars) == 0:
+        return ""
+    
+    lines = ["Here are some example workflows from previous tasks:\n"]
+    
+    for i, (workflow_output, score) in enumerate(exemplars, 1):
+        lines.append(f"Example {i} (Score: {score:.3f}):")
+        lines.append(f"{workflow_output}\n")
+    
+    return "\n".join(lines)
+
+
 # ============================================================================
 # Agent Generation Prompt
 # ============================================================================
@@ -151,6 +195,8 @@ Your analysis should enable a downstream workflow generator to create an executa
         (
             "user",
             """Task: {task}
+
+{exemplars_section}
 
 Analyze this task and generate a comprehensive meta-agent specification.
 
@@ -276,13 +322,13 @@ def node_2(state: State) -> dict:
 # Add more nodes as needed based on agent decomposition
 
 # CONDITIONAL EDGES (if needed)
-def should_continue(state: State) -> Literal["node_name", "end"]:
+def should_continue(state: State) -> Literal["node_1", END]:
     \"\"\"
     Routing logic for conditional branches
     \"\"\"
     if condition:
-        return "node_name"
-    return "end"
+        return "node_1"
+    return END
 
 # BUILD GRAPH
 graph_builder = StateGraph(State)
@@ -297,7 +343,7 @@ graph_builder.add_edge(START, "node_1")
 graph_builder.add_edge("node_1", "node_2")
 
 # Add conditional edges if needed
-# graph_builder.add_conditional_edges("node_2", should_continue)
+# graph_builder.add_conditional_edges("node_2", should_continue, ["node_1", END])
 
 # Add final edge to END
 graph_builder.add_edge("node_2", END)
@@ -355,6 +401,8 @@ Remember: The agent did the thinking and planning. Your job is to faithfully tra
 
 Meta-Agent Analysis:
 {agent_output}
+
+{exemplars_section}
 
 ---
 

@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, Optional, cast
 
 import dotenv
+import ray
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AnyMessage
 from langgraph.graph import END, START, StateGraph
@@ -37,10 +38,15 @@ from prompts import (
     WORKFLOW_GENERATION_PROMPT,
     LLM_JUDGE_PROMPT,
     get_variation_strategy,
+    format_agent_exemplars,
+    format_workflow_exemplars,
 )
 
 # Import workflow executor
 from workflow_executor import execute_workflow
+
+# Import bucket manager
+from buckets import get_or_create_bucket_manager # type:ignore
 
 
 # ============================================================================
@@ -118,8 +124,10 @@ class AgentWorkflowGraph:
         debug: bool = False,
         max_retries: int = 0,
         use_huggingface: bool = False,
+        bucket_manager: Optional[ray.actor.ActorHandle] = None, # type: ignore
     ):
         self.debug = debug
+        self.bucket_manager = bucket_manager # type: ignore
         
         # Initialize LLM
         if use_huggingface:
@@ -136,14 +144,14 @@ class AgentWorkflowGraph:
             
             self.llm = ChatHuggingFace(llm=HuggingFaceEndpoint(
                 model=self.model_name,  # Use model parameter instead of repo_id
-                # repo_id="deepseek-ai/DeepSeek-R1-0528",
                 task="text-generation",
                 huggingfacehub_api_token=os.environ.get("HUGGINGFACEHUB_API_TOKEN"),
                 temperature=temperature,
-                max_new_tokens=32768,
+                max_new_tokens=4096,
                 top_k=50,
                 top_p=0.95,
                 repetition_penalty=1.03,
+                timeout=300,
                 provider="nscale",  # Let HuggingFace choose the best provider
             ))
             
@@ -276,8 +284,22 @@ class AgentWorkflowGraph:
         """
         logger.info(f"[Agent Node] Generating meta-agent for task: {state['task'][:50]}...")
         
+        # Sample agent exemplars from bucket manager if available
+        exemplars = None
+        if self.bucket_manager is not None: # type: ignore
+            try:
+                exemplars = ray.get(self.bucket_manager.sample_agent_exemplars.remote()) # type: ignore
+                if exemplars:
+                    logger.info(f"[Agent Node] Sampled {len(exemplars)} agent exemplars from buckets")
+            except Exception as e:
+                logger.warning(f"[Agent Node] Failed to sample agent exemplars: {e}")
+        
+        # Format exemplars for prompt injection
+        exemplars_section = format_agent_exemplars(exemplars)
+        
         prompt = AGENT_GENERATION_PROMPT.invoke({ # type: ignore
-            "task": state["task"]
+            "task": state["task"],
+            "exemplars_section": exemplars_section,
         })
         
         result = self.invoke_prompt(prompt)
@@ -314,10 +336,24 @@ class AgentWorkflowGraph:
         """
         logger.info(f"[Workflow Node {workflow_id}] Generating workflow with variation strategy {workflow_id}...")
         
+        # Sample workflow exemplars from bucket manager if available
+        exemplars = None
+        if self.bucket_manager is not None: # type: ignore
+            try:
+                exemplars = ray.get(self.bucket_manager.sample_workflow_exemplars.remote()) # type: ignore
+                if exemplars:
+                    logger.info(f"[Workflow Node {workflow_id}] Sampled {len(exemplars)} workflow exemplars from buckets")
+            except Exception as e:
+                logger.warning(f"[Workflow Node {workflow_id}] Failed to sample workflow exemplars: {e}")
+        
+        # Format exemplars for prompt injection
+        exemplars_section = format_workflow_exemplars(exemplars)
+        
         prompt = WORKFLOW_GENERATION_PROMPT.invoke({ # type: ignore
             "task": state["task"],
             "agent_output": state["agent_output"],
             "variation_strategy": get_variation_strategy(workflow_id),
+            "exemplars_section": exemplars_section,
         })
         
         result = self.invoke_prompt(prompt)
@@ -400,7 +436,7 @@ class AgentWorkflowGraph:
         final_answer_key = f"workflow_{workflow_id}_final_answer"
         
         return { # type: ignore
-            result_key: {"executed": True, "result": result, "workflow": workflow_content},
+            result_key: {"executed": True, "result": result, "workflow": workflow_content, "code": workflow_code},
             final_answer_key: final_answer,
         }
 
@@ -471,6 +507,40 @@ class AgentWorkflowGraph:
         
         logger.info(f"[Aggregate] Scores - W1: {workflow_1_score:.1f}, W2: {workflow_2_score:.1f}, W3: {workflow_3_score:.1f}")
         logger.info(f"[Aggregate] Agent reward (avg): {agent_reward:.3f}")
+        
+        # Add agent and workflows to bucket manager if available
+        if self.bucket_manager is not None: # type: ignore
+            try:
+                # Add agent with its reward
+                ray.get(self.bucket_manager.add_agent.remote( # type: ignore
+                    state["agent_output_parsed"],
+                    agent_reward
+                ))
+                logger.info(f"[Aggregate] Added agent to bucket (score={agent_reward:.3f})")
+                
+                # Add all three workflows with their scores
+                if state.get("workflow_1_result") and state.get("workflow_1_result").get("code"): # type: ignore
+                    ray.get(self.bucket_manager.add_workflow.remote( # type: ignore
+                        state["workflow_1_result"].get("code"), # type: ignore
+                        workflow_1_score
+                    ))
+                if state.get("workflow_2_result") and state.get("workflow_2_result").get("code"): # type: ignore
+                    ray.get(self.bucket_manager.add_workflow.remote( # type: ignore
+                        state["workflow_2_result"].get("code"), # type: ignore
+                        workflow_2_score
+                    ))
+                if state.get("workflow_3_result") and state.get("workflow_3_result").get("code"): # type: ignore
+                    ray.get(self.bucket_manager.add_workflow.remote( # type: ignore
+                        state["workflow_3_result"].get("code"), # type: ignore
+                        workflow_3_score
+                    ))
+                logger.info(f"[Aggregate] Added 3 workflows to bucket")
+                
+                # Log bucket stats
+                stats = ray.get(self.bucket_manager.get_stats.remote()) # type: ignore
+                logger.info(f"[Aggregate] Bucket stats: {stats}")
+            except Exception as e:
+                logger.warning(f"[Aggregate] Failed to add to buckets: {e}")
         
         return {
             "workflow_1_score": workflow_1_score,
@@ -547,6 +617,11 @@ class LitWorkflowAgent(agentlightning.LitAgent): # type: ignore
         trained_agents: Optional[str] = r"generate_(agent|workflow_\d+)",
         val_temperature: Optional[float] = 0.0,
         debug: bool = False,
+        enable_buckets: bool = True,
+        bucket_min_agent_score: float = 0.0,
+        bucket_min_workflow_score: float = 0.0,
+        bucket_temperature_agent: float = 1.0,
+        bucket_temperature_workflow: float = 1.0,
     ) -> None:
         """
         Initialize the LitWorkflowAgent.
@@ -558,10 +633,21 @@ class LitWorkflowAgent(agentlightning.LitAgent): # type: ignore
                                        generate_workflow_2, generate_workflow_3
             val_temperature: Temperature for validation rollouts
             debug: Enable debug logging
+            enable_buckets: Whether to enable bucket manager for contrastive learning
+            bucket_min_agent_score: Minimum score threshold for adding agents to bucket
+            bucket_min_workflow_score: Minimum score threshold for adding workflows to bucket
+            bucket_temperature_agent: Temperature for agent bucket sampling (tau_A)
+            bucket_temperature_workflow: Temperature for workflow bucket sampling (tau_W)
         """
         super().__init__(trained_agents=trained_agents)
         self.val_temperature = val_temperature
         self.debug = debug
+        self.enable_buckets = enable_buckets
+        self.bucket_min_agent_score = bucket_min_agent_score
+        self.bucket_min_workflow_score = bucket_min_workflow_score
+        self.bucket_temperature_agent = bucket_temperature_agent
+        self.bucket_temperature_workflow = bucket_temperature_workflow
+        self._bucket_manager = None
 
     def _execute_rollout(
         self,
@@ -584,6 +670,27 @@ class LitWorkflowAgent(agentlightning.LitAgent): # type: ignore
         
         logger.info(f"[Rollout {rollout_id}] Task: {task[:100]}...")
         
+        # Initialize bucket manager if enabled and not already initialized
+        bucket_manager = None
+        if self.enable_buckets:
+            if self._bucket_manager is None: # type: ignore
+                try:
+                    if ray.is_initialized(): # type: ignore
+                        self._bucket_manager = get_or_create_bucket_manager( # type: ignore
+                            min_agent_score=self.bucket_min_agent_score,
+                            min_workflow_score=self.bucket_min_workflow_score,
+                            temperature_agent=self.bucket_temperature_agent,
+                            temperature_workflow=self.bucket_temperature_workflow,
+                        )
+                        logger.info(f"[Rollout {rollout_id}] Initialized bucket manager")
+                    else:
+                        logger.warning(f"[Rollout {rollout_id}] Ray not initialized, buckets disabled")
+                        self.enable_buckets = False
+                except Exception as e:
+                    logger.warning(f"[Rollout {rollout_id}] Failed to initialize bucket manager: {e}")
+                    self.enable_buckets = False
+            bucket_manager = self._bucket_manager # type: ignore
+        
         # Build graph with appropriate temperature
         graph = AgentWorkflowGraph( # type: ignore
             endpoint=llm.endpoint,
@@ -600,6 +707,7 @@ class LitWorkflowAgent(agentlightning.LitAgent): # type: ignore
                 }
             ),
             debug=self.debug,
+            bucket_manager=bucket_manager,
         ).build_graph()
         
         try:
